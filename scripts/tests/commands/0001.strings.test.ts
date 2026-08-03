@@ -14,77 +14,53 @@ import {
   waitFor,
 } from '../utils/index.ts';
 
-import type { StringOrBuffer } from '../../../sources/index.ts';
 import type { FeaturedClient } from '../utils/index.ts';
-
-/**
- * Checks if a command option is supported by the server.
- * Version checks are not reliable because Redis-compatible servers can support
- * different sets of options (e.g. Valkey 9.1 supports IFEQ but not all Redis 8.4 options).
- * Unsupported options return a syntax error or unknown command error.
- */
-async function probeOptionSupported(
-  client: FeaturedClient,
-  command: StringOrBuffer[],
-): Promise<boolean> {
-  const isUnsupported = (value: unknown): boolean =>
-    value instanceof Error &&
-    /syntax error|unknown command/i.test(value.message);
-
-  try {
-    const reply = await client.send([command]);
-
-    return !isUnsupported(reply?.[0]?.[0]);
-  } catch (error) {
-    return !isUnsupported(error);
-  }
-}
 
 describe('strings', () => {
   let client: FeaturedClient;
   const keyspace = createKeyspace('strings');
 
-  let supportsSetIfEq = false;
-  let supportsSetIfNe = false;
-  let supportsSetIfDeq = false;
-  let supportsSetIfDne = false;
-  let supportsDigest = false;
-  let supportsDelex = false;
+  let setIfEqAvailable = false;
+  let setIfNeAvailable = false;
+  let setIfDeqAvailable = false;
+  let setIfDneAvailable = false;
+  let digestAvailable = false;
+  let delexAvailable = false;
 
   before(async () => {
     client = await createClient();
 
     const probeKey = keyspace.key('probe');
-    supportsSetIfEq = await probeOptionSupported(client, [
+    setIfEqAvailable = await isCommandSupported(client, [
       'SET',
       probeKey,
       'x',
       'IFEQ',
       'x',
     ]);
-    supportsSetIfNe = await probeOptionSupported(client, [
+    setIfNeAvailable = await isCommandSupported(client, [
       'SET',
       probeKey,
       'x',
       'IFNE',
       'x',
     ]);
-    supportsSetIfDeq = await probeOptionSupported(client, [
+    setIfDeqAvailable = await isCommandSupported(client, [
       'SET',
       probeKey,
       'x',
       'IFDEQ',
       '0000000000000000',
     ]);
-    supportsSetIfDne = await probeOptionSupported(client, [
+    setIfDneAvailable = await isCommandSupported(client, [
       'SET',
       probeKey,
       'x',
       'IFDNE',
       '0000000000000000',
     ]);
-    supportsDigest = await isCommandSupported(client, ['DIGEST', probeKey]);
-    supportsDelex = await isCommandSupported(client, ['DELEX', probeKey]);
+    digestAvailable = await isCommandSupported(client, ['DIGEST', probeKey]);
+    delexAvailable = await isCommandSupported(client, ['DELEX', probeKey]);
 
     await client.del(probeKey);
   });
@@ -491,7 +467,7 @@ describe('strings', () => {
   });
 
   it('SET IFEQ guards on the current value', async (context) => {
-    if (!supportsSetIfEq) {
+    if (!setIfEqAvailable) {
       context.skip('requires Redis 8.4+ SET IFEQ');
       return;
     }
@@ -523,7 +499,7 @@ describe('strings', () => {
   });
 
   it('SET IFNE guards on the current value and creates missing keys', async (context) => {
-    if (!supportsSetIfNe) {
+    if (!setIfNeAvailable) {
       context.skip('requires Redis 8.4+ SET IFNE');
       return;
     }
@@ -556,7 +532,7 @@ describe('strings', () => {
   });
 
   it('DIGEST returns the XXH3 hex digest of a string value', async (context) => {
-    if (!supportsDigest) {
+    if (!digestAvailable) {
       context.skip('requires Redis 8.4+ DIGEST');
       return;
     }
@@ -572,7 +548,7 @@ describe('strings', () => {
   });
 
   it('SET IFDEQ / IFDNE guard on the current hash digest', async (context) => {
-    if (!(supportsSetIfDeq && supportsSetIfDne && supportsDigest)) {
+    if (!(setIfDeqAvailable && setIfDneAvailable && digestAvailable)) {
       context.skip('requires Redis 8.4+ SET IFDEQ/IFDNE and DIGEST');
       return;
     }
@@ -618,12 +594,12 @@ describe('strings', () => {
 
   it('DELEX conditionally removes a key', async (context) => {
     if (
-      !supportsDelex ||
-      !supportsSetIfEq ||
-      !supportsSetIfNe ||
-      !supportsSetIfDeq ||
-      !supportsSetIfDne ||
-      !supportsDigest
+      !delexAvailable ||
+      !setIfEqAvailable ||
+      !setIfNeAvailable ||
+      !setIfDeqAvailable ||
+      !setIfDneAvailable ||
+      !digestAvailable
     ) {
       context.skip('requires Redis 8.4+ DELEX and its condition options');
       return;
