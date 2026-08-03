@@ -10,17 +10,83 @@ import {
   closeClient,
   createClient,
   createKeyspace,
+  isCommandSupported,
   waitFor,
 } from '../utils/index.ts';
 
+import type { StringOrBuffer } from '../../../sources/index.ts';
 import type { FeaturedClient } from '../utils/index.ts';
+
+/**
+ * Checks if a command option is supported by the server.
+ * Version checks are not reliable because Redis-compatible servers can support
+ * different sets of options (e.g. Valkey 9.1 supports IFEQ but not all Redis 8.4 options).
+ * Unsupported options return a syntax error or unknown command error.
+ */
+async function probeOptionSupported(
+  client: FeaturedClient,
+  command: StringOrBuffer[],
+): Promise<boolean> {
+  const isUnsupported = (value: unknown): boolean =>
+    value instanceof Error &&
+    /syntax error|unknown command/i.test(value.message);
+
+  try {
+    const reply = await client.send([command]);
+
+    return !isUnsupported(reply?.[0]?.[0]);
+  } catch (error) {
+    return !isUnsupported(error);
+  }
+}
 
 describe('strings', () => {
   let client: FeaturedClient;
   const keyspace = createKeyspace('strings');
 
+  let supportsSetIfEq = false;
+  let supportsSetIfNe = false;
+  let supportsSetIfDeq = false;
+  let supportsSetIfDne = false;
+  let supportsDigest = false;
+  let supportsDelex = false;
+
   before(async () => {
     client = await createClient();
+
+    const probeKey = keyspace.key('probe');
+    supportsSetIfEq = await probeOptionSupported(client, [
+      'SET',
+      probeKey,
+      'x',
+      'IFEQ',
+      'x',
+    ]);
+    supportsSetIfNe = await probeOptionSupported(client, [
+      'SET',
+      probeKey,
+      'x',
+      'IFNE',
+      'x',
+    ]);
+    supportsSetIfDeq = await probeOptionSupported(client, [
+      'SET',
+      probeKey,
+      'x',
+      'IFDEQ',
+      '0000000000000000',
+    ]);
+    supportsSetIfDne = await probeOptionSupported(client, [
+      'SET',
+      probeKey,
+      'x',
+      'IFDNE',
+      '0000000000000000',
+    ]);
+    supportsDigest = await isCommandSupported(client, ['DIGEST', probeKey]);
+    supportsDelex = await isCommandSupported(client, ['DELEX', probeKey]);
+
+    await client.del(probeKey);
   });
 
   after(async () => {
@@ -360,5 +426,255 @@ describe('strings', () => {
     });
 
     assert.deepStrictEqual(command, ['SET', 'key', 'val', 'KEEPTTL', 'GET']);
+  });
+
+  it('builds SET with IFEQ / IFNE / IFDEQ / IFDNE condition tokens', async () => {
+    const { buildSetCommand } = await import(
+      '../../../sources/command/utils/command.ts'
+    );
+
+    assert.deepStrictEqual(
+      buildSetCommand('k', 'v', { setIfValueEquals: 'old' }),
+      ['SET', 'k', 'v', 'IFEQ', 'old'],
+    );
+    assert.deepStrictEqual(
+      buildSetCommand('k', 'v', { setIfValueNotEquals: 'old' }),
+      ['SET', 'k', 'v', 'IFNE', 'old'],
+    );
+    assert.deepStrictEqual(
+      buildSetCommand('k', 'v', { setIfDigestEquals: 'abc123' }),
+      ['SET', 'k', 'v', 'IFDEQ', 'abc123'],
+    );
+    assert.deepStrictEqual(
+      buildSetCommand('k', 'v', { setIfDigestNotEquals: 'abc123' }),
+      ['SET', 'k', 'v', 'IFDNE', 'abc123'],
+    );
+    assert.deepStrictEqual(
+      buildSetCommand('k', 'v', {
+        setIfValueEquals: 'old',
+        returnOldValue: true,
+      }),
+      ['SET', 'k', 'v', 'IFEQ', 'old', 'GET'],
+    );
+  });
+
+  it('builds DELEX with optional condition tokens', async () => {
+    const { buildDelexCommand } = await import(
+      '../../../sources/command/utils/command.ts'
+    );
+
+    assert.deepStrictEqual(buildDelexCommand('k'), ['DELEX', 'k']);
+    assert.deepStrictEqual(
+      buildDelexCommand('k', {
+        ifValueEquals: 'v',
+      }),
+      ['DELEX', 'k', 'IFEQ', 'v'],
+    );
+    assert.deepStrictEqual(
+      buildDelexCommand('k', {
+        ifValueNotEquals: 'v',
+      }),
+      ['DELEX', 'k', 'IFNE', 'v'],
+    );
+    assert.deepStrictEqual(
+      buildDelexCommand('k', {
+        ifDigestEquals: 'abc123',
+      }),
+      ['DELEX', 'k', 'IFDEQ', 'abc123'],
+    );
+    assert.deepStrictEqual(
+      buildDelexCommand('k', {
+        ifDigestNotEquals: 'abc123',
+      }),
+      ['DELEX', 'k', 'IFDNE', 'abc123'],
+    );
+  });
+
+  it('SET IFEQ guards on the current value', async (context) => {
+    if (!supportsSetIfEq) {
+      context.skip('requires Redis 8.4+ SET IFEQ');
+      return;
+    }
+
+    const key = keyspace.key('set-ifeq');
+
+    // IFEQ against a missing key does not create it.
+    assert.strictEqual(
+      await client.set(key, 'a', { setIfValueEquals: 'x' }),
+      null,
+    );
+    assert.strictEqual(await client.get(key), null);
+
+    await client.set(key, 'a');
+
+    // IFEQ mismatch is a no-op.
+    assert.strictEqual(
+      await client.set(key, 'b', { setIfValueEquals: 'x' }),
+      null,
+    );
+    assert.strictEqual(await client.get(key), 'a');
+
+    // IFEQ match applies the new value.
+    assert.strictEqual(
+      await client.set(key, 'b', { setIfValueEquals: 'a' }),
+      'OK',
+    );
+    assert.strictEqual(await client.get(key), 'b');
+  });
+
+  it('SET IFNE guards on the current value and creates missing keys', async (context) => {
+    if (!supportsSetIfNe) {
+      context.skip('requires Redis 8.4+ SET IFNE');
+      return;
+    }
+
+    const key = keyspace.key('set-ifne');
+
+    await client.set(key, 'b');
+
+    // IFNE mismatch (value equals) is a no-op.
+    assert.strictEqual(
+      await client.set(key, 'c', { setIfValueNotEquals: 'b' }),
+      null,
+    );
+    assert.strictEqual(await client.get(key), 'b');
+
+    // IFNE match applies the new value.
+    assert.strictEqual(
+      await client.set(key, 'c', { setIfValueNotEquals: 'x' }),
+      'OK',
+    );
+    assert.strictEqual(await client.get(key), 'c');
+
+    // IFNE against a missing key creates it.
+    const fresh = keyspace.key('set-ifne-create');
+    assert.strictEqual(
+      await client.set(fresh, 'created', { setIfValueNotEquals: 'anything' }),
+      'OK',
+    );
+    assert.strictEqual(await client.get(fresh), 'created');
+  });
+
+  it('DIGEST returns the XXH3 hex digest of a string value', async (context) => {
+    if (!supportsDigest) {
+      context.skip('requires Redis 8.4+ DIGEST');
+      return;
+    }
+
+    const key = keyspace.key('digest');
+
+    assert.strictEqual(await client.digest(key), null);
+
+    await client.set(key, 'Hello world');
+
+    const d = await client.digest(key);
+    assert.ok(typeof d === 'string' && /^[0-9a-fA-F]+$/.test(d), `${d}`);
+  });
+
+  it('SET IFDEQ / IFDNE guard on the current hash digest', async (context) => {
+    if (!(supportsSetIfDeq && supportsSetIfDne && supportsDigest)) {
+      context.skip('requires Redis 8.4+ SET IFDEQ/IFDNE and DIGEST');
+      return;
+    }
+
+    const key = keyspace.key('set-ifdeq-ifdne');
+
+    await client.set(key, 'v1');
+    const d1 = await client.digest(key);
+    assert.ok(typeof d1 === 'string');
+
+    // IFDEQ with a non-matching digest is a no-op.
+    assert.strictEqual(
+      await client.set(key, 'v2', { setIfDigestEquals: '0000000000000000' }),
+      null,
+    );
+    assert.strictEqual(await client.get(key), 'v1');
+
+    // IFDEQ with the matching digest applies.
+    assert.strictEqual(
+      await client.set(key, 'v2', { setIfDigestEquals: d1 }),
+      'OK',
+    );
+    assert.strictEqual(await client.get(key), 'v2');
+
+    // Recompute the digest for the new value before testing IFDNE.
+    const d2 = await client.digest(key);
+    assert.ok(typeof d2 === 'string');
+
+    // IFDNE with the matching digest is a no-op.
+    assert.strictEqual(
+      await client.set(key, 'v3', { setIfDigestNotEquals: d2 }),
+      null,
+    );
+    assert.strictEqual(await client.get(key), 'v2');
+
+    // IFDNE with a non-matching digest applies.
+    assert.strictEqual(
+      await client.set(key, 'v3', { setIfDigestNotEquals: '0000000000000000' }),
+      'OK',
+    );
+    assert.strictEqual(await client.get(key), 'v3');
+  });
+
+  it('DELEX conditionally removes a key', async (context) => {
+    if (
+      !supportsDelex ||
+      !supportsSetIfEq ||
+      !supportsSetIfNe ||
+      !supportsSetIfDeq ||
+      !supportsSetIfDne ||
+      !supportsDigest
+    ) {
+      context.skip('requires Redis 8.4+ DELEX and its condition options');
+      return;
+    }
+
+    const key = keyspace.key('delex');
+
+    // Without a condition, DELEX behaves like DEL.
+    await client.set(key, 'v');
+    assert.strictEqual(await client.delex(key), 1);
+    assert.strictEqual(await client.get(key), null);
+    assert.strictEqual(await client.delex(key), 0);
+
+    // IFEQ only deletes when the current value matches.
+    await client.set(key, 'v');
+    assert.strictEqual(await client.delex(key, { ifValueEquals: 'wrong' }), 0);
+    assert.strictEqual(await client.get(key), 'v');
+    assert.strictEqual(await client.delex(key, { ifValueEquals: 'v' }), 1);
+    assert.strictEqual(await client.get(key), null);
+
+    // IFNE deletes when the current value differs.
+    await client.set(key, 'v');
+    assert.strictEqual(await client.delex(key, { ifValueNotEquals: 'v' }), 0);
+    assert.strictEqual(
+      await client.delex(key, { ifValueNotEquals: 'other' }),
+      1,
+    );
+    assert.strictEqual(await client.get(key), null);
+
+    // IFDEQ / IFDNE based on the digest.
+    await client.set(key, 'v');
+    const digest = await client.digest(key);
+    assert.ok(typeof digest === 'string');
+
+    assert.strictEqual(
+      await client.delex(key, { ifDigestEquals: '0000000000000000' }),
+      0,
+    );
+    assert.strictEqual(await client.get(key), 'v');
+    assert.strictEqual(await client.delex(key, { ifDigestEquals: digest }), 1);
+    assert.strictEqual(await client.get(key), null);
+
+    await client.set(key, 'v');
+    assert.strictEqual(
+      await client.delex(key, { ifDigestNotEquals: digest }),
+      0,
+    );
+    assert.strictEqual(
+      await client.delex(key, { ifDigestNotEquals: '0000000000000000' }),
+      1,
+    );
+    assert.strictEqual(await client.get(key), null);
   });
 });

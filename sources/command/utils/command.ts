@@ -11,6 +11,7 @@ import {
 
 import type {
   CommandCuckooFilterInsertOptions,
+  CommandDelexOptions,
   CommandExpireMode,
   CommandGeoRadiusOptions,
   CommandGeoSearchByOptions,
@@ -209,9 +210,47 @@ export function buildSetCommand(
       command.push('XX');
     }
 
+    if (options.setIfValueEquals !== undefined) {
+      command.push('IFEQ', options.setIfValueEquals);
+    }
+
+    if (options.setIfValueNotEquals !== undefined) {
+      command.push('IFNE', options.setIfValueNotEquals);
+    }
+
+    if (options.setIfDigestEquals !== undefined) {
+      command.push('IFDEQ', options.setIfDigestEquals);
+    }
+
+    if (options.setIfDigestNotEquals !== undefined) {
+      command.push('IFDNE', options.setIfDigestNotEquals);
+    }
+
     if (options.returnOldValue === true) {
       command.push('GET');
     }
+  }
+
+  return command;
+}
+
+export function buildDelexCommand(key: string, options?: CommandDelexOptions) {
+  const command: StringOrBuffer[] = ['DELEX', key];
+
+  if (options?.ifValueEquals !== undefined) {
+    command.push('IFEQ', options.ifValueEquals);
+  }
+
+  if (options?.ifValueNotEquals !== undefined) {
+    command.push('IFNE', options.ifValueNotEquals);
+  }
+
+  if (options?.ifDigestEquals !== undefined) {
+    command.push('IFDEQ', options.ifDigestEquals);
+  }
+
+  if (options?.ifDigestNotEquals !== undefined) {
+    command.push('IFDNE', options.ifDigestNotEquals);
   }
 
   return command;
